@@ -5,6 +5,7 @@ adafruit-circuitpython-busdevice==5.2.14
 adafruit-circuitpython-connectionmanager==3.1.6
 adafruit-circuitpython-gps==3.11.6
 adafruit-circuitpython-requests==4.1.15
+adafruit-circuitpython-sht4x
 adafruit-circuitpython-sht31d==2.3.29
 adafruit-circuitpython-typing==1.12.3
 Adafruit-PlatformDetect==3.85.0
