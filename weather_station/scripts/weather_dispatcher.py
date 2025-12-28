@@ -1,23 +1,16 @@
+#!/usr/bin/env python3
 """
 weather_dispatcher.py
----------------------
-WeatherStation Dispatcher (GPS-only, console output).
+
+WeatherStation Dispatcher (heartbeat mode).
 
 Purpose:
-- Serve as the top-level runtime loop for the WeatherStation.
-- Import DriverManager and consume its payload.
-- Print clean, human-readable status to the command line.
-- Mirror the structural role of BirdStation's dispatcher, without transport logic.
+- Periodically emit a node heartbeat containing GPS + environment status.
+- Reuse NodeDatabase and send_over_wifi exactly as BirdStation does.
+- Run independently under systemd with clean failure isolation.
 
-Scope (for now):
-- No WiFi, no LoRa, no persistence.
-- GPS + PPS only.
-- Output is purely diagnostic and observational.
-
-Design principles:
-- Dispatcher never talks directly to drivers.
-- Dispatcher never applies validation or filtering.
-- Dispatcher never crashes on partial failure.
+Testing cadence: 10 seconds
+Production cadence: 300 seconds (5 minutes)
 """
 
 from __future__ import annotations
@@ -25,30 +18,37 @@ from __future__ import annotations
 import time
 import signal
 import sys
+from datetime import datetime, timezone
 from typing import Optional
 
 from driver_manager import DriverManager
+from node_database import NodeDatabase
+import send_over_wifi
+
+
+# -----------------
+# Configuration
+# -----------------
+
+NODE_ID = "node0"
+
+HEARTBEAT_PERIOD_S = 10.0   # ← testing cadence
+# HEARTBEAT_PERIOD_S = 300.0  # ← production cadence (5 minutes)
+
+DB_PATH = "/home/node0/weather_station/runtime/weatherstation_events.db"
 
 
 class WeatherDispatcher:
     """
-    Top-level dispatcher loop for the WeatherStation.
+    Top-level dispatcher for WeatherStation heartbeat events.
     """
 
-    def __init__(
-        self,
-        *,
-        loop_hz: float = 1.0,
-        debug: bool = True,
-    ) -> None:
-        if loop_hz <= 0:
-            raise ValueError("loop_hz must be > 0")
-
-        self.loop_hz = loop_hz
+    def __init__(self, *, debug: bool = True) -> None:
         self.debug = debug
         self._running = False
 
         self.driver_manager = DriverManager(debug=debug)
+        self.db = NodeDatabase(DB_PATH)
 
     # -----------------
     # Lifecycle
@@ -83,7 +83,6 @@ class WeatherDispatcher:
         """
         Blocking dispatcher loop.
         """
-        period = 1.0 / self.loop_hz
         self.start()
 
         try:
@@ -92,7 +91,7 @@ class WeatherDispatcher:
                 self._dispatch_once()
 
                 elapsed = time.monotonic() - loop_start
-                sleep_s = period - elapsed
+                sleep_s = HEARTBEAT_PERIOD_S - elapsed
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
@@ -104,30 +103,25 @@ class WeatherDispatcher:
     def _dispatch_once(self) -> None:
         payload = self.driver_manager.get_payload()
 
-        status = payload.get("status")
-        gps = payload.get("gps") or {}
-
-        # Build a compact, readable line similar to BirdStation-style diagnostics.
-        line = {
-            "status": status,
-            "time_source": gps.get("time_source"),
-            "pps_present": gps.get("pps_present"),
-            "pps_locked": gps.get("pps_locked"),
-            "gps_link_ok": gps.get("gps_link_ok"),
-            "gps_valid": gps.get("gps_position_valid"),
-            "lat": gps.get("lat_dd"),
-            "lon": gps.get("lon_dd"),
-            "alt_m": gps.get("alt_m"),
-            "sats": gps.get("satellites"),
-            "hdop": gps.get("hdop"),
-            "node_time_s": gps.get("node_time_s"),
+        event = {
+            "event_type": "node_heartbeat",
+            "node_id": NODE_ID,
+            "subsystem": "weatherstation",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
         }
 
-        print(line)
-
-        # Optional verbose diagnostics
-        if self.debug and payload.get("last_error"):
-            print("  ERROR:", payload["last_error"])
+        # Attempt immediate send
+        try:
+            send_over_wifi.send_event(event)
+            self.db.flush_pending()
+            self._dbg("Heartbeat sent successfully.")
+        except Exception as e:
+            self._dbg(f"Send failed, queueing heartbeat: {e}")
+            self.db.enqueue_event(
+                event_type=event["event_type"],
+                payload=event,
+            )
 
     # -----------------
     # Utilities
@@ -157,6 +151,6 @@ def _install_signal_handlers(dispatcher: WeatherDispatcher) -> None:
 # -----------------
 
 if __name__ == "__main__":
-    dispatcher = WeatherDispatcher(loop_hz=1.0, debug=True)
+    dispatcher = WeatherDispatcher(debug=True)
     _install_signal_handlers(dispatcher)
     dispatcher.run_forever()
